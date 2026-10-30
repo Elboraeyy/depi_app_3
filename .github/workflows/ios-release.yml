@@ -1,187 +1,120 @@
-name: Build signed iOS IPA and create Release
+name: Build unsigned iOS IPA and create Release
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
-        description: "App version, for example 1.0.1"
-        required: true
-        default: "1.0.0"
-        type: string
-      build_number:
-        description: "Optional iOS build number. Defaults to the GitHub run number."
+        description: "Optional app version, for example 1.0.1"
         required: false
         default: ""
         type: string
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: write
 
 jobs:
-  build-ios:
+  build-ipa:
+    name: Build unsigned iOS IPA
     runs-on: macos-15
+    timeout-minutes: 35
     env:
+      COCOAPODS_DISABLE_STATS: "true"
       APP_NAME: "DEPI Workspace"
       APP_SLUG: "depi-app"
-      BUNDLE_ID: "com.example.depiApp"
-      FLUTTER_VERSION: "3.41.9"
-      IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
-      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-      IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
-      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Validate Apple signing secrets
-        shell: bash
-        run: |
-          missing=()
-          [[ -n "$IOS_CERTIFICATE_BASE64" ]] || missing+=("IOS_CERTIFICATE_BASE64")
-          [[ -n "$IOS_CERTIFICATE_PASSWORD" ]] || missing+=("IOS_CERTIFICATE_PASSWORD")
-          [[ -n "$IOS_PROVISION_PROFILE_BASE64" ]] || missing+=("IOS_PROVISION_PROFILE_BASE64")
-          [[ -n "$IOS_TEAM_ID" ]] || missing+=("IOS_TEAM_ID")
-
-          if (( ${#missing[@]} > 0 )); then
-            echo "::error::Missing GitHub repository secrets: ${missing[*]}"
-            echo "Create an Apple Distribution certificate and an Ad Hoc provisioning profile for $BUNDLE_ID, then add the required secrets."
-            exit 1
-          fi
-
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
+          flutter-version: "3.41.9"
           channel: stable
           cache: true
 
-      - name: Install CocoaPods dependencies
-        shell: bash
+      - name: Show tool versions
         run: |
-          flutter pub get
-          cd ios
-          pod install --repo-update
+          flutter --version
+          xcodebuild -version
 
-      - name: Import Apple Distribution certificate
-        shell: bash
-        env:
-          P12_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-        run: |
-          CERTIFICATE_PATH="$RUNNER_TEMP/distribution_certificate.p12"
-          KEYCHAIN_PATH="$RUNNER_TEMP/build-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+      - name: Install Flutter dependencies
+        run: flutter pub get
 
-          printf '%s' "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+      - name: Verify Dart code
+        run: flutter analyze
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security
-          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
-          security default-keychain -s "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-      - name: Install Ad Hoc provisioning profile
-        shell: bash
-        run: |
-          PROFILE_PATH="$RUNNER_TEMP/ad_hoc.mobileprovision"
-          PROFILE_PLIST="$RUNNER_TEMP/ad_hoc.plist"
-          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
-
-          printf '%s' "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
-          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
-
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print:UUID" "$PROFILE_PLIST")
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print:Name" "$PROFILE_PLIST")
-          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c "Print:Entitlements:application-identifier" "$PROFILE_PLIST")
-
-          if [[ "$PROFILE_APP_ID" != "$IOS_TEAM_ID.$BUNDLE_ID" ]]; then
-            echo "::error::Provisioning profile is for $PROFILE_APP_ID, but this app needs $IOS_TEAM_ID.$BUNDLE_ID"
-            exit 1
-          fi
-
-          mkdir -p "$PROFILE_DIR"
-          cp "$PROFILE_PATH" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
-          echo "IOS_PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+      - name: Run tests
+        run: flutter test
 
       - name: Calculate version
         shell: bash
         run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="${{ inputs.version }}"
+          VERSION="${{ inputs.version }}"
+          if [[ -z "$VERSION" ]]; then
+            VERSION="$(awk '/^version:/ {print $2; exit}' pubspec.yaml | cut -d+ -f1)"
           fi
 
-          BUILD_NUMBER="${{ inputs.build_number }}"
-          if [[ -z "$BUILD_NUMBER" ]]; then
-            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Could not determine the app version."
+            exit 1
           fi
 
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=ios-v$VERSION-build-$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$APP_SLUG-ios-unsigned-v$VERSION-build-$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
 
-      - name: Build unsigned iOS archive
+      - name: Build iOS app without signing
+        run: |
+          flutter build ios --release --no-codesign --build-name="$VERSION" --build-number="$BUILD_NUMBER"
+
+      - name: Package and verify IPA
         shell: bash
         run: |
-          flutter build ipa --release --no-codesign --build-name="$VERSION" --build-number="$BUILD_NUMBER"
+          set -euo pipefail
 
-      - name: Export signed Ad Hoc IPA
-        shell: bash
-        run: |
-          ARCHIVE_PATH="$(find build/ios/archive -maxdepth 1 -name '*.xcarchive' -type d | head -n 1)"
-          [[ -n "$ARCHIVE_PATH" ]] || { echo "::error::No iOS archive was produced"; exit 1; }
+          app_path="$(find "$GITHUB_WORKSPACE/build/ios/iphoneos" -maxdepth 1 -type d -name 'Runner.app' -print -quit)"
 
-          python3 - <<'PY'
-          import os
-          import plistlib
-          from pathlib import Path
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Runner.app was not produced by the iOS build."
+            find "$GITHUB_WORKSPACE/build/ios" -maxdepth 4 -print
+            exit 1
+          fi
 
-          export_options = {
-              "method": "ad-hoc",
-              "signingStyle": "manual",
-              "signingCertificate": "Apple Distribution",
-              "teamID": os.environ["IOS_TEAM_ID"],
-              "provisioningProfiles": {
-                  os.environ["BUNDLE_ID"]: os.environ["IOS_PROFILE_NAME"],
-              },
-              "destination": "export",
-              "stripSwiftSymbols": True,
-              "compileBitcode": False,
-              "thinning": "<none>",
-          }
+          staging_dir="$RUNNER_TEMP/$APP_SLUG-ipa"
+          rm -rf "$staging_dir"
+          mkdir -p "$staging_dir/Payload"
+          cp -R "$app_path" "$staging_dir/Payload/Runner.app"
 
-          output = Path("build/ios/ExportOptions.plist")
-          output.parent.mkdir(parents=True, exist_ok=True)
-          output.write_bytes(plistlib.dumps(export_options, fmt=plistlib.FMT_XML))
-          PY
+          ipa_path="$GITHUB_WORKSPACE/build/ios/$APP_SLUG-ios-unsigned-$VERSION-$BUILD_NUMBER.ipa"
+          ditto -c -k --sequesterRsrc --keepParent "$staging_dir/Payload" "$ipa_path"
 
-          rm -rf build/ios/ipa
-          mkdir -p build/ios/ipa
-          xcodebuild -exportArchive -archivePath "$ARCHIVE_PATH" -exportPath build/ios/ipa -exportOptionsPlist build/ios/ExportOptions.plist -allowProvisioningUpdates
+          unzip -t "$ipa_path"
+          unzip -l "$ipa_path" | grep -q 'Payload/Runner.app/Info.plist'
+          shasum -a 256 "$ipa_path" > "$ipa_path.sha256"
 
-          IPA_PATH="$(find build/ios/ipa -maxdepth 1 -name '*.ipa' -type f | head -n 1)"
-          [[ -n "$IPA_PATH" ]] || { echo "::error::No signed IPA was exported"; exit 1; }
-          FINAL_IPA="build/ios/ipa/$APP_SLUG-$VERSION-$BUILD_NUMBER.ipa"
-          mv "$IPA_PATH" "$FINAL_IPA"
-          echo "FINAL_IPA=$FINAL_IPA" >> "$GITHUB_ENV"
+          echo "IPA_PATH=$ipa_path" >> "$GITHUB_ENV"
+          echo "SHA_PATH=$ipa_path.sha256" >> "$GITHUB_ENV"
+          ls -lh "$ipa_path" "$ipa_path.sha256"
 
       - name: Create GitHub Release and upload IPA
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$RELEASE_TAG" "$FINAL_IPA" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$APP_NAME $VERSION ($BUILD_NUMBER)" --notes "Signed Ad Hoc iOS build for $APP_NAME. Install the IPA on a registered device."
+          gh release create "$RELEASE_TAG" "$IPA_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$APP_NAME iOS unsigned $VERSION ($BUILD_NUMBER)" --notes "Unsigned IPA for $APP_NAME. It is downloadable for inspection, but it cannot be installed on a physical iPhone until it is signed with an Apple certificate and a provisioning profile."
 
       - name: Upload IPA as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_SLUG }}-ios-${{ env.VERSION }}-${{ env.BUILD_NUMBER }}
-          path: ${{ env.FINAL_IPA }}
+          name: ${{ env.APP_SLUG }}-ios-unsigned-${{ env.VERSION }}-${{ env.BUILD_NUMBER }}
+          path: |
+            ${{ env.IPA_PATH }}
+            ${{ env.SHA_PATH }}
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
